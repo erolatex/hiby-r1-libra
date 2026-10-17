@@ -45,6 +45,7 @@
 #include "audio.h"
 #include "wsola.h"
 #include "eq.h"
+#include "pcm_gain.h"
 #include "radio_buffer.h"
 
 /* Bound the log. Four writers (alog here, mlog in music_hook.c, ilog in index.c,
@@ -3231,6 +3232,12 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
     if (use_bt) rate = bt_target_rate(rate);   /* BG41 -- see bt_target_rate() */
 
     int card = ucard > 0 ? ucard : 0;
+    /* Keep the fractional samples produced by software attenuation of MP3,
+     * AAC and other S16 sources. The built-in DAC accepts S24_LE. USB keeps
+     * its requested format, and Bluetooth still negotiates S16_LE below.
+     * Do this here so resume and output-route changes use the same policy. */
+    if (!use_bt && card == 0 && want_fmt == FMT_S16_LE)
+        want_fmt = FMT_S24_LE;
     snprintf(exact, sizeof(exact), "hw:%d,0", card);
     snprintf(plug,  sizeof(plug),  "plughw:%d,0", card);
 
@@ -3608,6 +3615,42 @@ static void *write_pcm_frames(void *pcm, const char *p, snd_pcm_uframes_t left,
         struct timespec w1;
         clock_gettime(CLOCK_MONOTONIC, &w1);
         bt_stall_check(frames, (w1.tv_sec - w0.tv_sec) * 1000L + (w1.tv_nsec - w0.tv_nsec) / 1000000L);
+    }
+    return pcm;
+}
+
+/* S16 decode/WSOLA buffers stay at full level until this final write.
+ * Packing follows the negotiated format, including a wide output's S16
+ * fallback. Static scratch belongs to the one joined audio worker. */
+static void *write_s16_frames(void *pcm, const short *samples,
+                              snd_pcm_uframes_t frames, int channels, int volume) {
+    static union {
+        int16_t s16[8192];
+        int32_t s32[8192];
+    } packed;
+    static uint32_t random_state = UINT32_C(0x91e10da5);
+    unsigned bits = g_out_fmt == FMT_S32_LE ? 32
+                  : g_out_fmt == FMT_S24_LE ? 24 : 16;
+    int32_t gain = pcm_gain_for_volume(volume);
+    if (bits == 16 && gain == PCM_GAIN_ONE)
+        return write_pcm_frames(pcm, (const char *)samples, frames,
+                                (size_t)channels * sizeof(int16_t));
+    while (frames > 0) {
+        snd_pcm_uframes_t chunk = 8192 / (unsigned)channels;
+        if (chunk > frames) chunk = frames;
+        size_t count = (size_t)chunk * (size_t)channels;
+        for (size_t i = 0; i < count; i++) {
+            int32_t value = pcm_gain_s16(samples[i], gain, bits, &random_state);
+            if (bits == 16) packed.s16[i] = (int16_t)value;
+            else            packed.s32[i] = value;
+        }
+        size_t sample_bytes = bits == 16 ? sizeof(int16_t) : sizeof(int32_t);
+        const char *data = bits == 16 ? (const char *)packed.s16
+                                     : (const char *)packed.s32;
+        pcm = write_pcm_frames(pcm, data, chunk, (size_t)channels * sample_bytes);
+        if (!pcm) return NULL;
+        samples += count;
+        frames -= chunk;
     }
     return pcm;
 }
@@ -4339,18 +4382,14 @@ static void *worker(void *arg) {
              * depth at all. Samples are the same 32-bit-left-aligned form as
              * the hires branch above; the discarded precision is the low 16
              * bits, so the dither is scaled to +/-1 LSB at 16-bit. */
-            int gain = vol < 100 ? vol * vol * 256 / 10000 : 256;
+            /* Volume is applied after WSOLA, in write_s16_frames(). */
             for (size_t i = 0; i < n; i++) {
                 int32_t noise = ((rand() & 0xFFFF) - 0x8000)
                                + ((rand() & 0xFFFF) - 0x8000);   /* two uniform -> triangular */
                 int32_t v = (buf32[i] + (noise >> 1)) >> 16;
                 if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
-                if (gain != 256) v = (v * gain) >> 8;
                 buf[i] = (short)v;
             }
-        } else if (vol < 100) {
-            int gain = vol * vol * 256 / 10000;     /* squared: usable at low settings */
-            for (size_t i = 0; i < n; i++) buf[i] = (short)((buf[i] * gain) >> 8);
         }
 
         /* WSOLA changes what leaves the buffer from here on, not how much
@@ -4378,13 +4417,16 @@ static void *worker(void *arg) {
                 int of = wsola_drain(&g_wsola, g_wsola_out,
                                      (int)(sizeof(g_wsola_out) / sizeof(short) / ch));
                 if (of <= 0) break;
-                pcm = write_pcm_frames(pcm, (const char *)g_wsola_out,
-                                       (snd_pcm_uframes_t)of, frame_bytes);
+                pcm = write_s16_frames(pcm, g_wsola_out,
+                                       (snd_pcm_uframes_t)of, ch, vol);
                 if (!pcm) break;
             }
         } else {
-            const char *p = hires ? (const char *)buf32 : (const char *)buf;
-            pcm = write_pcm_frames(pcm, p, (snd_pcm_uframes_t)got, frame_bytes);
+            if (hires)
+                pcm = write_pcm_frames(pcm, (const char *)buf32,
+                                       (snd_pcm_uframes_t)got, frame_bytes);
+            else
+                pcm = write_s16_frames(pcm, buf, (snd_pcm_uframes_t)got, ch, vol);
         }
         /* The write did not happen, so the position must not advance. */
         if (!pcm) continue;
